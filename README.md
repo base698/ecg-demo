@@ -1,20 +1,44 @@
-# Execution Compatibility Graph — libraries and runnable demo
+# Execution Compatibility Graph (ECG)
 
+ECG is an experimental system for deciding **which service versions have enough
+checked evidence to serve traffic together**. It tracks what each immutable
+release has actually demonstrated, lets candidates earn traffic independently,
+and withdraws admission when the required evidence fails or expires.
 
-ECG now contains reusable Go packages, an observation-only evidence container,
-and the routed todo demo that exercises them.
+## What it is for
 
-| Package | Responsibility |
-|---|---|
-| `ecg` | Release identity, artifact/configuration digests, trace vocabulary. |
-| `sdk` | Application-owned observations and versioned checks; optional injected tracing; bounded asynchronous export. |
-| `evidence` | Versioned evidence partitions, declared requirements, coverage/correctness/freshness/confidence/latency evaluation. |
-| `evidence/memory`, `evidence/redisstore` | Bounded stores with atomic duplicate detection and conflicting-ID rejection. |
-| `evidencehttp` | Observation/evaluation HTTP handler and client; no deployment control. |
+Teams that deploy interacting services need to answer a practical question:
+**Will this release work with the versions running now, for the operations and
+feature settings that matter?** A passing build or a healthy service average can
+hide a failure in one dependency combination, business operation, or flag state.
+Shared integration and staging environments also make unrelated changes queue
+behind one another.
 
-[Library guide](docs/library.md) includes embedding, the HTTP protocol, lifecycle,
-limits, and local-module imports. [Generic label example](examples/labels/README.md)
-uses a fictional local service and runs through the public SDK.
+ECG's goal is to make release decisions specific to the version and its evidence.
+Tests and requests produce observations tied to exact versioned execution paths,
+named scenarios, evaluated flags, and explicit response checks. Declared
+requirements determine what must be demonstrated; missing evidence stays
+missing. The graph connects immutable service versions through the requests
+that exercised them together.
+
+A traffic controller can use that evidence to admit a candidate, expand its
+exposure, hold it for more checks, or withdraw it. Versions qualify in parallel,
+and qualification is reassessed when their dependencies or evidence change.
+Existing tests and observability supply the observations; application owners
+still define the checks and the acceptance policy.
+
+For example, suppose `tasks@2` passes ordinary todo requests but returns the
+wrong priority when `express=on`. Evidence for
+`api@1 → tasks@2 → store@1`, scenario `add`, flags `express=on` records the failed
+response check even if the request returns HTTP 200. Successful `list` requests
+cannot satisfy that `add` requirement. If the deployed store changes to
+`store@2`, the new version combination needs its own evidence.
+
+The intended users are application and platform teams exploring independent
+service releases and evidence-driven traffic control. This repository provides
+embeddable libraries and a runnable demonstration of that model. It is a
+prototype: its checks establish only the properties they test, and its traffic
+controller is designed for the bounded demo described below.
 
 ## Continuous qualification
 
@@ -28,6 +52,23 @@ withdraws expired or failing stable admissions, and retires drained versions.
 [Design and implementation](docs/continuous-qualification.md) maps this reference
 to the working demo and explains its boundaries: private local fixtures,
 read-only shadow traffic, conditional confidence, and a single controller.
+
+## What is in this repository
+
+This repository contains reusable Go packages, an observation-only evidence container,
+and the routed todo demo that exercises them.
+
+| Package | Responsibility |
+|---|---|
+| `ecg` | Release identity, artifact/configuration digests, trace vocabulary. |
+| `sdk` | Application-owned observations and versioned checks; optional injected tracing; bounded asynchronous export. |
+| `evidence` | Versioned evidence partitions, declared requirements, coverage/correctness/freshness/confidence/latency evaluation. |
+| `evidence/memory`, `evidence/redisstore` | Bounded stores with atomic duplicate detection and conflicting-ID rejection. |
+| `evidencehttp` | Observation/evaluation HTTP handler and client; no deployment control. |
+
+[Library guide](docs/library.md) includes embedding, the HTTP protocol, lifecycle,
+limits, and local-module imports. [Generic label example](examples/labels/README.md)
+uses a fictional local service and runs through the public SDK.
 
 ## Library service by itself
 
