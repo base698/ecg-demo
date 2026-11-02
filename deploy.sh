@@ -7,7 +7,8 @@
 #   ./deploy.sh tasks 4 CONTRACT=v2          # different contract → different node key
 #
 # The instance registers with the controller on startup, becomes a candidate,
-# and inherits obligations derived from the current baseline's evidence.
+# runs an isolated contract suite, then gathers evidence against current baselines.
+# Use EXPOSURE=shadow to mirror reads without serving customer responses.
 set -euo pipefail
 svc=${1:?service (api|tasks|store)}; ver=${2:?version}; shift 2
 case "$svc" in api|tasks|store) ;; *) echo "unknown service: $svc" >&2; exit 1 ;; esac

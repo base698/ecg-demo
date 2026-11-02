@@ -388,12 +388,23 @@ func (c *controller) assemble(ctx context.Context, spans []span) {
 		lat = hops[0].LatencyMS
 	}
 	incomplete := len(gaps) > 0 || mismatch != ""
+	if failed || incomplete {
+		c.routeAssessments = nil
+	}
 	info := sample{ID: id, MS: ms, Failed: failed, Checked: checked, AssertionFailed: assertionFailed, Incomplete: incomplete, LatencyMS: lat, Source: source}
 	c.exportLibraryObservation(ctx, hops, scenario, flags, assertion, info)
 	rec := recentTrace{TS: ms, Path: ecg.JoinPath(labels), Scenario: scenario, Flags: flags, Tenant: tenant, Source: source, Eligible: eligible, Failed: failed, Outcome: outcome, LatMS: lat, TraceID: id, Assertion: assertion}
 	pipe := c.rdb.TxPipeline()
 	pipe.HIncrBy(ctx, "stats", "traces", 1)
-	if incomplete {
+	if source == "shadow" {
+		for _, sp := range spans {
+			if nk := sp.Attrs["ecg.shadow_node"]; nk != "" {
+				c.writeSample(pipe, ctx, "shadow:"+nk, info)
+				break
+			}
+		}
+		rec.Note = "shadow read; separate evidence, no live promotion credit"
+	} else if incomplete {
 		pipe.HIncrBy(ctx, "stats", "gaps", 1)
 		rec.Note = strings.Join(gaps, "; ")
 		if mismatch != "" {
@@ -407,7 +418,25 @@ func (c *controller) assemble(ctx context.Context, spans []span) {
 	}
 	// All observed participants and intended targets retain negative/uncertain
 	// evidence, including candidates that failed before producing a server span.
+	allStable := source != "shadow"
+	currentBaselines := map[string]bool{}
+	for _, in := range c.instances(ctx) {
+		if in.Role == "baseline" {
+			currentBaselines[in.NodeKey] = true
+		}
+	}
 	for nk := range affected {
+		if !currentBaselines[nk] {
+			allStable = false
+		}
+	}
+	if allStable {
+		c.writeSample(pipe, ctx, "stable-signal:"+c.baselineContext(ctx, nil), info)
+	}
+	for nk := range affected {
+		if source == "shadow" {
+			continue
+		}
 		key := "signal:" + nk + ":" + scenario + "|" + flags
 		c.writeSample(pipe, ctx, key, info)
 		pipe.SAdd(ctx, "signals:"+nk, key)

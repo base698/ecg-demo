@@ -50,7 +50,7 @@ svg text{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;fill:var(--fg)}
 @media (max-width:1000px){main{grid-template-columns:1fr}}
 </style></head><body>
 <header>
-  <h1>Execution Compatibility Graph <span>deployment evidence · explicit checks · promotion</span></h1>
+  <h1>Execution Compatibility Graph <span>continuous qualification · independent versions</span></h1>
   <span class="stat">traces <b id="st-traces">0</b></span>
   <span class="stat">spans <b id="st-spans">0</b></span>
   <span class="stat">gaps <b id="st-gaps">0</b></span>
@@ -64,7 +64,7 @@ svg text{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;fill:var(--fg)}
 </header>
 <main>
  <section class="wide"><h2>What the evidence supports</h2><div id="capabilities"></div></section>
-  <section class="wide"><h2>Instances <span class="hint">· deploy a new version with <code>./deploy.sh tasks 2</code> (or <code>./deploy.sh tasks 3 FAIL_RATE=0.3</code> for a regression)</span></h2><div class="cols" id="instances"></div></section>
+  <section class="wide"><h2>Version qualification <span class="hint">· deploy a new version with <code>./deploy.sh tasks 2</code> (or <code>./deploy.sh tasks 3 FAIL_RATE=0.3</code> for a regression)</span></h2><div class="cols" id="instances"></div></section>
 <section class="wide gate"><h2>Promotion requirements <span class="hint">· exact full paths against the current baselines · one candidate per request</span></h2><div id="obligations"></div></section>
   <section class="wide"><h2>Versioned path graph <span class="hint">· traffic and prefix coverage overview</span></h2>
     <div id="graph"></div>
@@ -99,9 +99,10 @@ function renderInstances(s){
   const ob={};(s.obligations||[]).forEach(o=>ob[o.instance]=o);
   $('#instances').innerHTML=s.services.map(svc=>'<div class="col"><h3>'+esc(svc)+'</h3>'+s.instances.filter(i=>i.service===svc).map(i=>{
     const o=ob[i.id];const st=o?'<span class="chip '+o.status+'">'+o.status.toUpperCase()+(o.rows.length?' '+o.satisfied+'/'+o.rows.length:'')+'</span>':'';
-    const btn=(i.role==='candidate'||i.role==='draining')?'<button class="danger" style="margin-left:auto" data-retire="'+esc(i.id)+'">retire</button>':'';
+    const btn=(i.role==='candidate'||i.role==='draining'||i.role==='suspended')?'<button class="danger" style="margin-left:auto" data-retire="'+esc(i.id)+'">retire</button>':'';
+    const exposure=i.role==='candidate'&&i.isolation_status==='passed'?'<button data-exposure="'+esc(i.id)+'" data-mode="'+(i.exposure==='shadow'?'canary':'shadow')+'">'+(i.exposure==='shadow'?'admit canary':'shadow only')+'</button>':'';
     const cfg=[i.fail_rate?'fail_rate='+i.fail_rate:'',i.latency_ms?'latency='+i.latency_ms+'ms':'',i.contract!=='v1'?'contract='+i.contract:''].filter(Boolean).join(' · ');
-    return '<div class="card"><div class="top"><span class="id">'+esc(i.id)+'</span><span class="chip '+i.role+'">'+i.role+'</span>'+st+btn+'</div><div class="meta">v'+esc(i.version)+' · node_key <code>'+esc(i.node_key.slice(0,8))+'</code> · routed '+i.routes+'× · seen '+ago(i.last_seen)+' ago'+(cfg?'<br><span class="s-partial">'+esc(cfg)+'</span>':'')+'</div></div>'}).join('')+'</div>').join('');
+    return '<div class="card"><div class="top"><span class="id">'+esc(i.id)+'</span><span class="chip '+i.role+'">'+esc(i.exposure)+'</span>'+st+btn+'</div><div class="meta">v'+esc(i.version)+' · node_key <code>'+esc(i.node_key.slice(0,8))+'</code> · routed '+i.routes+'× · seen '+ago(i.last_seen)+' ago<br>Isolated suite: <b>'+esc(i.isolation_status||'missing')+'</b> · Shadow reads: '+i.shadow_count+' ('+esc(i.shadow_status)+') '+exposure+(i.reason?'<br>'+esc(i.reason):'')+(cfg?'<br><span class="s-partial">'+esc(cfg)+'</span>':'')+'</div></div>'}).join('')+'</div>').join('');
 }
 function renderGraph(s){
   const svcs=s.services, colW=240, nodeW=150, nodeH=44, gapY=26, padX=40;
@@ -132,12 +133,12 @@ function renderMatrix(s){
 function percent(x){return (100*x).toFixed(1)+'%'}
 function renderCapabilities(s){
  const mode=s.policy.require_confidence?'Confidence gate':'Demo coverage gate';
- $('#capabilities').innerHTML='<div class="evidence-grid"><div><b>Coverage</b><p>Unique complete requests on exact versioned paths. Minimum '+s.policy.threshold+' fresh requests per requirement.</p></div><div><b>Correctness</b><p>Explicit todo response assertions. A 200 response can fail. Durable writes and cross-request invariants are not checked.</p></div><div><b>Freshness & performance</b><p>Rolling '+s.policy.evidence_ttl_s+'s window. Mean latency compared with the matching fresh baseline.</p></div><div><b>'+mode+'</b><p>'+(s.policy.require_confidence?'The 95% error upper bound must satisfy the error budget.':'Sample minimum controls promotion; the confidence bound is displayed but does not gate.')+' The bound assumes independent representative requests.</p></div></div><div class="decision">'+(s.ledger_error?'<b class="s-failed">'+esc(s.ledger_error)+'</b>':'Scope: synchronous linear paths with retries. Concurrent candidates are tested separately. Fan-out, async work, and automatic rollback are not implemented.')+'</div>';
+ $('#capabilities').innerHTML='<div class="evidence-grid"><div><b>Coverage</b><p>Unique complete requests on exact versioned paths. Minimum '+s.policy.threshold+' fresh requests per requirement.</p></div><div><b>Correctness</b><p>Explicit todo response assertions. A 200 response can fail. Durable writes and cross-request invariants are not checked.</p></div><div><b>Freshness & performance</b><p>Rolling '+s.policy.evidence_ttl_s+'s window. Mean latency compared with the matching fresh baseline.</p></div><div><b>'+mode+'</b><p>'+(s.policy.require_confidence?'The 95% error upper bound must satisfy the error budget.':'Sample minimum controls promotion; the confidence bound is displayed but does not gate.')+' The bound assumes independent representative requests.</p></div></div><div class="decision">'+(s.ledger_error?'<b class="s-failed">'+esc(s.ledger_error)+'</b>':'Parallel qualification: isolated fixture checks → independent canary or read-only shadow → stable. Stable admission is continuously checked; rollback requires fresh predecessor evidence. Shadow traffic cannot qualify live writes. Scope: one controller, synchronous linear paths.')+'</div>';
 }
 function renderObligations(s){
  const obs=s.obligations||[];
  if(!obs.length){$('#obligations').innerHTML='<div class="empty">No candidates. Deploy a version to see its full-path requirements.</div>';return}
- $('#obligations').innerHTML=obs.map(o=>'<div class="ob"><div class="head"><b>'+esc(o.instance)+'</b><span class="chip '+o.status+'">'+o.status.toUpperCase()+'</span><span class="stat">'+o.satisfied+'/'+o.rows.length+' requirements · baseline '+esc(o.baseline)+(s.active_candidate===o.instance?' · receiving experiment traffic':'')+'</span></div>'+(o.reasons.length?'<div class="decision">'+o.reasons.map(esc).join(' · ')+'</div>':'')+(o.rows.length?'<div class="scroll"><table><tr><th>required full path</th><th>scenario / flag</th><th>coverage</th><th>correctness</th><th>freshness</th><th>error upper 95%</th><th>latency / baseline</th><th>decision</th></tr>'+o.rows.map(r=>{const e=r.evidence;return '<tr><td>'+esc(r.label)+'</td><td>'+esc(r.scenario)+'<br><span class="stat">'+esc(r.flags)+'</span></td><td>'+r.count+'/'+r.threshold+'<br><span class="stat">'+esc(e.coverage)+'</span></td><td>'+esc(e.correctness.replaceAll('_',' '))+'<br><span class="stat">'+r.errors+' errors</span></td><td>'+esc(e.freshness)+'</td><td>'+percent(e.error_upper_95)+'<br><span class="stat">'+(e.confidence==='insufficient'?'insufficient':'supported under assumptions')+'</span></td><td>'+e.avg_ms.toFixed(0)+' / '+e.baseline_avg_ms.toFixed(0)+' ms<br><span class="stat">'+esc(e.performance.replaceAll('_',' '))+'</span></td><td class="s-'+r.status+'">'+(SYM[r.status]||'?')+' '+esc(r.status)+'<div class="reason">'+e.reasons.map(esc).join('; ')+'</div></td></tr>'}).join('')+'</table></div>':'<div class="empty">Waiting for successful baseline observations.</div>')+'</div>').join('');
+ $('#obligations').innerHTML=obs.map(o=>'<div class="ob"><div class="head"><b>'+esc(o.instance)+'</b><span class="chip '+o.status+'">'+o.status.toUpperCase()+'</span><span class="stat">'+o.satisfied+'/'+o.rows.length+' requirements · baseline '+esc(o.baseline)+((s.active_candidates||[]).includes(o.instance)?' · receiving experiment traffic':'')+'</span></div>'+(o.reasons.length?'<div class="decision">'+o.reasons.map(esc).join(' · ')+'</div>':'')+(o.rows.length?'<div class="scroll"><table><tr><th>required full path</th><th>scenario / flag</th><th>coverage</th><th>correctness</th><th>freshness</th><th>error upper 95%</th><th>latency / baseline</th><th>decision</th></tr>'+o.rows.map(r=>{const e=r.evidence;return '<tr><td>'+esc(r.label)+'</td><td>'+esc(r.scenario)+'<br><span class="stat">'+esc(r.flags)+'</span></td><td>'+r.count+'/'+r.threshold+'<br><span class="stat">'+esc(e.coverage)+'</span></td><td>'+esc(e.correctness.replaceAll('_',' '))+'<br><span class="stat">'+r.errors+' errors</span></td><td>'+esc(e.freshness)+'</td><td>'+percent(e.error_upper_95)+'<br><span class="stat">'+(e.confidence==='insufficient'?'insufficient':'supported under assumptions')+'</span></td><td>'+e.avg_ms.toFixed(0)+' / '+e.baseline_avg_ms.toFixed(0)+' ms<br><span class="stat">'+esc(e.performance.replaceAll('_',' '))+'</span></td><td class="s-'+r.status+'">'+(SYM[r.status]||'?')+' '+esc(r.status)+'<div class="reason">'+e.reasons.map(esc).join('; ')+'</div></td></tr>'}).join('')+'</table></div>':'<div class="empty">Waiting for successful baseline observations.</div>')+'</div>').join('');
 }
 function renderPaths(s){
  const ps=s.paths||[];if(!ps.length){$('#paths').innerHTML='<div class="empty">No complete observations yet.</div>';return}
@@ -146,7 +147,8 @@ function renderPaths(s){
 async function retire(id){if(!confirm('Retire '+id+'? It will exit on its next heartbeat and its evidence will remain as historical observations.'))return;const r=await fetch('/api/retire?id='+encodeURIComponent(id),{method:'POST'});if(!r.ok)alert(await r.text());tick()}
 async function reset(){if(!confirm('Clear all evidence?'))return;await fetch('/api/reset',{method:'POST'});tick()}
 async function setThr(){await fetch('/api/policy?threshold='+$('#thr').value+'&mode='+$('#mode').value,{method:'POST'});tick()}
-document.addEventListener('click',e=>{const b=e.target.closest('[data-retire]');if(b)retire(b.dataset.retire)});
+async function exposure(id,mode){const r=await fetch('/api/exposure?id='+encodeURIComponent(id)+'&mode='+mode,{method:'POST'});if(!r.ok)alert(await r.text());tick()}
+document.addEventListener('click',e=>{const b=e.target.closest('[data-retire]');if(b)retire(b.dataset.retire);const x=e.target.closest('[data-exposure]');if(x)exposure(x.dataset.exposure,x.dataset.mode)});
 async function libraryTick(){
  try{
   const r=await fetch('/api/library',{cache:'no-store'});if(!r.ok)throw Error('Evidence service unavailable');

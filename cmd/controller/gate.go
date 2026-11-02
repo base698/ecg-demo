@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/base698/ecg-demo/ecg"
+	"github.com/base698/ecg-demo/internal/democontract"
 )
 
 type obRow struct {
@@ -43,7 +44,20 @@ type obligation struct {
 // substituting the CURRENT baselines and this candidate. Old/draining versions
 // are never required. Exact downstream identities remain part of the gate.
 func (c *controller) obligationsFor(ctx context.Context, cand, base instance) obligation {
+	return c.requirementsFor(ctx, cand, base, true)
+}
+
+func (c *controller) requirementsFor(ctx context.Context, cand, base instance, includeSignals bool) obligation {
 	ob := obligation{Instance: cand.ID, Service: cand.Service, Version: cand.Version, NodeKey: cand.NodeKey, Baseline: base.ID, Rows: []obRow{}, Reasons: []string{}}
+	isolated, err := c.rdb.HGet(ctx, "qualification:"+cand.release().Key()+":"+democontract.IsolationSuite, "status").Result()
+	if err != nil || isolated != "passed" {
+		ob.Status = "unknown"
+		if isolated == "failed" {
+			ob.Status = "failed"
+		}
+		ob.Reasons = append(ob.Reasons, "isolated contract suite has not passed for this exact release")
+		return ob
+	}
 	if c.ledgerErr != "" {
 		ob.Status = "unknown"
 		ob.Reasons = append(ob.Reasons, c.ledgerErr)
@@ -63,6 +77,7 @@ func (c *controller) obligationsFor(ctx context.Context, cand, base instance) ob
 	}
 	sort.Strings(paths)
 	required := map[string]bool{}
+	approvedIdentity := map[string]bool{}
 	for _, pk := range paths {
 		m, err := c.rdb.HGetAll(ctx, "path:"+pk).Result()
 		if err != nil {
@@ -81,12 +96,20 @@ func (c *controller) obligationsFor(ctx context.Context, cand, base instance) ob
 		failures, _ := strconv.ParseInt(m["errors"], 10, 64)
 		approved := true
 		for _, nk := range nks {
+			known, found := approvedIdentity[nk]
+			if found {
+				if !known {
+					approved = false
+				}
+				continue
+			}
 			ok, e := c.rdb.Exists(ctx, "approved:"+nk).Result()
 			if e != nil {
 				ob.Status = "unknown"
 				ob.Reasons = append(ob.Reasons, "cannot read release history")
 				return ob
 			}
+			approvedIdentity[nk] = ok != 0
 			if ok == 0 {
 				approved = false
 			}
@@ -154,6 +177,9 @@ func (c *controller) obligationsFor(ctx context.Context, cand, base instance) ob
 		return ob
 	}
 	for _, key := range signalKeys {
+		if !includeSignals {
+			break
+		}
 		r := c.loadRow(ctx, key)
 		a := c.assess(r, nil)
 		if a.Status == "failed" {
@@ -209,6 +235,7 @@ func (ob obligation) deficitFor(prefixIn string, threshold int) int {
 
 func (c *controller) promotionLoop() {
 	for range time.Tick(2 * time.Second) {
+		c.maintainAdmissions(context.Background())
 		c.promoteReady(context.Background())
 	}
 }
@@ -217,7 +244,7 @@ func (c *controller) promoteReady(ctx context.Context) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, cand := range c.instances(ctx) {
-		if cand.Role != "candidate" {
+		if cand.Role != "candidate" || cand.Exposure != "canary" || cand.IsolationStatus != "passed" {
 			continue
 		}
 		base := c.baselineOf(ctx, cand.Service)
@@ -229,10 +256,10 @@ func (c *controller) promoteReady(ctx context.Context) {
 			continue
 		}
 		p := c.rdb.TxPipeline()
-		p.HSet(ctx, "inst:"+cand.ID, "role", "baseline")
+		p.HSet(ctx, "inst:"+cand.ID, "role", "baseline", "qualified", "true", "admission_seq", c.rdb.Incr(ctx, "admission_seq").Val())
 		for _, in := range c.instances(ctx) {
 			if in.Service == base.Service && in.Role == "baseline" {
-				p.HSet(ctx, "inst:"+in.ID, "role", "draining")
+				p.HSet(ctx, "inst:"+in.ID, "role", "draining", "draining_since", time.Now().UnixMilli())
 			}
 		}
 		p.Set(ctx, "baseline:"+cand.Service, cand.NodeKey, 0)
@@ -241,6 +268,7 @@ func (c *controller) promoteReady(ctx context.Context) {
 			c.ledgerErr = "promotion storage failure; reset evidence after recovery"
 			return
 		}
+		c.routeAssessments = nil
 		c.event(ctx, "promote", fmt.Sprintf("%s PROMOTED (%d exact-path requirements; mode=%s); %s draining", cand.ID, len(ob.Rows), c.pol.Mode(), base.ID))
 		// Recompute every other candidate against the new baseline next tick.
 		return

@@ -3,8 +3,8 @@
 //   - the registry: which instances exist, their node keys and roles
 //     (baseline / candidate / draining / retired)
 //   - the router: given (service, prefix_in, eligible) it computes the
-//     prospective key H(prefix_in, node_key) for every candidate and sends
-//     eligible traffic to the one with the largest evidence deficit
+//     prospective key H(prefix_in, node_key) and rotates eligible requests
+//     across independently qualifying candidates
 //   - the ledger: an OTLP/HTTP receiver that assembles traces into versioned
 //     path attestations (see ledger.go)
 //   - obligations & promotion: derived from the baseline's evidence (state.go)
@@ -32,6 +32,7 @@ import (
 	"github.com/base698/ecg-demo/ecg"
 	"github.com/base698/ecg-demo/evidence"
 	"github.com/base698/ecg-demo/evidencehttp"
+	"github.com/base698/ecg-demo/internal/democontract"
 	"github.com/base698/ecg-demo/internal/demotel"
 	"github.com/base698/ecg-demo/sdk"
 
@@ -47,16 +48,20 @@ import (
 type policy = evidence.Policy
 
 type controller struct {
-	mu            sync.Mutex // serializes registry, evidence, policy, and promotion decisions
-	ledgerErr     string
-	libraryClient *evidencehttp.Client
-	libraryExport *sdk.Async
-	libraryErr    string
-	rdb           *redis.Client
-	pol           policy
-	canary        map[string]bool
-	tracer        trace.Tracer
-	client        *http.Client
+	mu               sync.Mutex // serializes registry, evidence, policy, and promotion decisions
+	ledgerErr        string
+	libraryClient    *evidencehttp.Client
+	libraryExport    *sdk.Async
+	libraryErr       string
+	rdb              *redis.Client
+	pol              policy
+	canary           map[string]bool
+	tracer           trace.Tracer
+	client           *http.Client
+	rolloutCursor    uint64
+	routeAssessments map[string]routingAssessment
+	shadowCursor     uint64
+	shadowSlots      chan struct{}
 }
 
 func env(k, d string) string {
@@ -72,9 +77,10 @@ func main() {
 	defer shutdown(ctx)
 
 	c := &controller{
-		rdb:    redis.NewClient(&redis.Options{Addr: env("REDIS_ADDR", "redis:6379")}),
-		canary: map[string]bool{},
-		tracer: otel.Tracer("ingress"),
+		rdb:         redis.NewClient(&redis.Options{Addr: env("REDIS_ADDR", "redis:6379")}),
+		canary:      map[string]bool{},
+		shadowSlots: make(chan struct{}, 4),
+		tracer:      otel.Tracer("ingress"),
 		client: &http.Client{Timeout: 15 * time.Second, Transport: otelhttp.NewTransport(http.DefaultTransport,
 			otelhttp.WithSpanOptions(trace.WithAttributes(attribute.String(ecg.AttrTarget, "api"))))},
 	}
@@ -114,6 +120,7 @@ func main() {
 	mux.HandleFunc("/api/state", c.handleState)
 	mux.HandleFunc("/api/library", c.handleLibrary)
 	mux.HandleFunc("/api/retire", c.handleRetire)
+	mux.HandleFunc("/api/exposure", c.handleExposure)
 	mux.HandleFunc("/api/reset", c.handleReset)
 	mux.HandleFunc("/api/policy", c.handlePolicy)
 	mux.HandleFunc("/app/api/", c.handleIngress)
@@ -152,21 +159,30 @@ func main() {
 // ---- registry ---------------------------------------------------------------
 
 type instance struct {
-	ID         string  `json:"id"`
-	Service    string  `json:"service"`
-	Version    string  `json:"version"`
-	Contract   string  `json:"contract"`
-	Config     string  `json:"config"`
-	Artifact   string  `json:"artifact"`
-	NodeKey    string  `json:"node_key"`
-	Addr       string  `json:"addr"`
-	Next       string  `json:"next"`
-	FailRate   float64 `json:"fail_rate"`
-	LatencyMS  int     `json:"latency_ms"`
-	Role       string  `json:"role"`
-	Registered int64   `json:"registered"`
-	LastSeen   int64   `json:"last_seen"`
-	Routes     int64   `json:"routes"`
+	ID                string                     `json:"id"`
+	Service           string                     `json:"service"`
+	Version           string                     `json:"version"`
+	Contract          string                     `json:"contract"`
+	Config            string                     `json:"config"`
+	Artifact          string                     `json:"artifact"`
+	NodeKey           string                     `json:"node_key"`
+	Addr              string                     `json:"addr"`
+	Next              string                     `json:"next"`
+	FailRate          float64                    `json:"fail_rate"`
+	LatencyMS         int                        `json:"latency_ms"`
+	Role              string                     `json:"role"`
+	Registered        int64                      `json:"registered"`
+	LastSeen          int64                      `json:"last_seen"`
+	Routes            int64                      `json:"routes"`
+	Bootstrap         bool                       `json:"bootstrap,omitempty"`
+	RequestedExposure string                     `json:"requested_exposure,omitempty"`
+	Isolated          *democontract.IsolationRun `json:"isolated,omitempty"`
+	IsolationStatus   string                     `json:"isolation_status"`
+	Exposure          string                     `json:"exposure"`
+	ShadowStatus      string                     `json:"shadow_status"`
+	ShadowCount       int64                      `json:"shadow_count"`
+	AdmissionSeq      int64                      `json:"admission_seq"`
+	Reason            string                     `json:"reason,omitempty"`
 }
 
 const instTTL = 12 * time.Second
@@ -176,8 +192,12 @@ func (c *controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 	defer c.mu.Unlock()
 	ctx := r.Context()
 	var in instance
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.ID == "" || in.Service == "" {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil || in.ID == "" || in.Service == "" {
 		http.Error(w, "bad registration", 400)
+		return
+	}
+	if err := in.release().Validate(); err != nil {
+		http.Error(w, err.Error(), 400)
 		return
 	}
 	if in.NodeKey != ecg.NodeKey(in.Service, in.Version, in.Contract, in.Config) {
@@ -191,8 +211,20 @@ func (c *controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "registry unavailable", 503)
 		return
 	}
-	if existing["node_key"] != "" && existing["node_key"] != in.NodeKey && existing["role"] != "retired" {
+	if existing["node_key"] != "" && (existing["node_key"] != in.NodeKey || existing["artifact"] != in.Artifact) && existing["role"] != "retired" {
 		http.Error(w, "instance identity changed; use a new INSTANCE_ID", 409)
+		return
+	}
+	isolation, err := c.recordIsolation(ctx, in)
+	if err != nil {
+		http.Error(w, "invalid or unavailable isolated evidence: "+err.Error(), 400)
+		return
+	}
+	if in.RequestedExposure == "" {
+		in.RequestedExposure = "canary"
+	}
+	if in.RequestedExposure != "canary" && in.RequestedExposure != "shadow" {
+		http.Error(w, "invalid exposure", 400)
 		return
 	}
 	role := existing["role"]
@@ -203,24 +235,25 @@ func (c *controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"role": "retired"})
 		return
 	case role == "":
+		c.routeAssessments = nil
 		// New instance: first alive instance of a service becomes baseline,
 		// every later one is a candidate that must earn promotion.
-		if b := c.baselineOf(ctx, in.Service); b == nil && (!c.rdb.SIsMember(ctx, "services", in.Service).Val() || c.rdb.Get(ctx, "baseline:"+in.Service).Val() == in.NodeKey) {
+		if b := c.baselineOf(ctx, in.Service); b == nil && isolation == "passed" && c.rdb.Exists(ctx, "revoked:"+in.NodeKey).Val() == 0 && ((in.Bootstrap && c.rdb.Exists(ctx, "baseline:"+in.Service).Val() == 0) || c.rdb.Get(ctx, "baseline:"+in.Service).Val() == in.NodeKey) {
 			role = "baseline"
 			c.rdb.Set(ctx, "baseline:"+in.Service, in.NodeKey, 0)
 			c.event(ctx, "bootstrap", fmt.Sprintf("%s registered as baseline of %s (node_key %s)", in.ID, in.Service, in.NodeKey))
-		} else if b != nil && b.NodeKey == in.NodeKey {
+		} else if b != nil && b.NodeKey == in.NodeKey && isolation == "passed" {
 			role = "baseline"
 		} else {
 			role = "candidate"
 			c.event(ctx, "deploy", fmt.Sprintf("%s registered as candidate of %s (node_key %s); obligations derived from %s", in.ID, in.Service, in.NodeKey, "current baseline"))
 		}
-		c.rdb.HSet(ctx, key, "registered", now)
+		c.rdb.HSet(ctx, key, "registered", now, "exposure", in.RequestedExposure)
 	}
 	c.rdb.HSet(ctx, key, map[string]any{
 		"id": in.ID, "service": in.Service, "version": in.Version, "contract": in.Contract, "config": in.Config,
 		"artifact": in.Artifact, "node_key": in.NodeKey, "addr": in.Addr, "next": in.Next, "fail_rate": in.FailRate, "latency_ms": in.LatencyMS,
-		"role": role, "last_seen": now,
+		"role": role, "last_seen": now, "isolation_status": isolation,
 	})
 	c.rdb.Expire(ctx, key, instTTL)
 	c.rdb.HSet(ctx, "identity:"+in.ID, "node_key", in.NodeKey, "service", in.Service, "version", in.Version, "contract", in.Contract, "config", in.Config, "artifact", in.Artifact)
@@ -249,8 +282,10 @@ func (c *controller) instances(ctx context.Context) []instance {
 		in.NodeKey, in.Addr, in.Next, in.Role = m["node_key"], m["addr"], m["next"], m["role"]
 		in.FailRate, _ = strconv.ParseFloat(m["fail_rate"], 64)
 		in.LatencyMS, _ = strconv.Atoi(m["latency_ms"])
+		in.AdmissionSeq, _ = strconv.ParseInt(m["admission_seq"], 10, 64)
 		in.Registered, _ = strconv.ParseInt(m["registered"], 10, 64)
 		in.LastSeen, _ = strconv.ParseInt(m["last_seen"], 10, 64)
+		in.IsolationStatus, in.Exposure, in.Reason = m["isolation_status"], m["exposure"], m["reason"]
 		in.Routes, _ = c.rdb.Get(ctx, "routes:"+in.ID).Int64()
 		out = append(out, in)
 	}
@@ -310,8 +345,7 @@ func (c *controller) handleRoute(w http.ResponseWriter, r *http.Request) {
 
 // handleIngress is the edge: it starts the trace, decides eligibility from the
 // tenant, routes to an api instance and proxies the call. This is the same
-// path the synthetic loadgen takes, so browser clicks and synthetic traffic
-// produce identical evidence.
+// path the synthetic loadgen takes. The library retains their source labels.
 func (c *controller) handleIngress(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/app/api")
 	tenant := r.Header.Get("X-Tenant")
@@ -319,10 +353,11 @@ func (c *controller) handleIngress(w http.ResponseWriter, r *http.Request) {
 		tenant = "anon"
 	}
 	eligible := c.canary[tenant]
-	source := r.Header.Get("X-Ecg-Source")
-	if source == "" {
-		source = "browser"
+	source := "browser"
+	if r.Header.Get("X-Ecg-Source") == "synthetic" {
+		source = "synthetic"
 	}
+	// A caller cannot label a live write as shadow and bypass live accounting.
 
 	ctx, span := c.tracer.Start(r.Context(), "ingress "+r.Method+" "+path, trace.WithSpanKind(trace.SpanKindInternal),
 		trace.WithAttributes(attribute.String(ecg.AttrTenant, tenant), attribute.Bool(ecg.AttrEligible, eligible),
@@ -349,7 +384,14 @@ func (c *controller) handleIngress(w http.ResponseWriter, r *http.Request) {
 	bag, _ := baggage.New(members...)
 	ctx = baggage.ContextWithBaggage(ctx, bag)
 
-	body, _ := io.ReadAll(r.Body)
+	body, bodyErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if bodyErr != nil {
+		http.Error(w, "request too large", 413)
+		return
+	}
+	if r.Method == "GET" && path == "/todos" {
+		c.mirrorReads(tenant, r.URL.RawQuery)
+	}
 	req, _ := http.NewRequestWithContext(ctx, r.Method, rt.Addr+path+querySuffix(r.URL.RawQuery), bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(ecg.HdrIntended, rt.Instance)
@@ -403,6 +445,7 @@ func (c *controller) handleRetire(w http.ResponseWriter, r *http.Request) {
 // retire changes reachability, preserving historical evidence. A live replica
 // with the same identity keeps that identity applicable.
 func (c *controller) retire(ctx context.Context, id, nodeKey, role string) {
+	c.routeAssessments = nil
 	c.rdb.HSet(ctx, "inst:"+id, "role", "retired")
 	c.rdb.Expire(ctx, "inst:"+id, instTTL)
 	labels := c.labelsForNode(ctx, nodeKey)
@@ -421,6 +464,7 @@ func (c *controller) retire(ctx context.Context, id, nodeKey, role string) {
 func (c *controller) handleReset(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.routeAssessments = nil
 	if r.Method != "POST" {
 		http.Error(w, "POST only", 405)
 		return
@@ -441,6 +485,7 @@ func (c *controller) handleReset(w http.ResponseWriter, r *http.Request) {
 func (c *controller) handlePolicy(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.routeAssessments = nil
 	if r.Method == "POST" {
 		if mode := r.URL.Query().Get("mode"); mode != "" {
 			if mode != "coverage" && mode != "confidence" {

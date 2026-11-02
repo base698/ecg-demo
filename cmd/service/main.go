@@ -46,6 +46,9 @@ import (
 type cfg struct {
 	service, version, contract, config, next, instance, controller, port string
 	artifact                                                             string
+	isolated                                                             *democontract.IsolationRun
+	bootstrap                                                            bool
+	exposure                                                             string
 	failRate                                                             float64
 	latencyMS, timeoutMS, slowMS                                         int
 	nodeKey                                                              string
@@ -84,6 +87,16 @@ func main() {
 	c.artifact = artifact
 	c.config = effectiveConfig(c, artifact)
 	c.nodeKey = ecg.NodeKey(c.service, c.version, c.contract, c.config)
+
+	// Qualification runs before telemetry and before connecting to shared Redis.
+	// Every process has private fixtures; no test writes reach the demo data.
+	run, err := isolatedChecks(c)
+	if err != nil {
+		log.Fatal("isolated checks: ", err)
+	}
+	c.isolated = &run
+	c.bootstrap = env("BOOTSTRAP", "false") == "true"
+	c.exposure = env("EXPOSURE", "canary")
 
 	ctx := context.Background()
 	shutdown := demotel.SetupOTel(ctx, c.service, c.version, c.instance,
@@ -154,6 +167,7 @@ func register(c cfg) (string, error) {
 		"id": c.instance, "service": c.service, "version": c.version, "contract": c.contract,
 		"artifact": c.artifact, "config": c.config, "node_key": c.nodeKey, "addr": env("ADDR", "http://"+c.instance+":"+c.port),
 		"next": c.next, "fail_rate": c.failRate, "latency_ms": c.latencyMS,
+		"isolated": c.isolated, "bootstrap": c.bootstrap, "requested_exposure": c.exposure,
 	})
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Post(c.controller+"/register", "application/json", bytes.NewReader(body))
@@ -179,13 +193,16 @@ type routeResp struct {
 	Reason   string `json:"reason"`
 }
 
-func route(ctx context.Context, c cfg, service, prefix string, eligible bool) (routeResp, error) {
+func route(ctx context.Context, c cfg, service, prefix string, eligible bool, client *http.Client) (routeResp, error) {
 	q := url.Values{"service": {service}, "prefix": {prefix}, "eligible": {strconv.FormatBool(eligible)}, "plan": {baggage.FromContext(ctx).Member(ecg.BagPlan).Value()}}
 	req, err := http.NewRequestWithContext(ctx, "GET", c.controller+"/route?"+q.Encode(), nil)
 	if err != nil {
 		return routeResp{}, err
 	}
-	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if client == nil {
+		client = &http.Client{Timeout: 3 * time.Second}
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return routeResp{}, err
 	}
@@ -202,9 +219,10 @@ func route(ctx context.Context, c cfg, service, prefix string, eligible bool) (r
 // ---------------------------------------------------------------------------
 
 type svc struct {
-	c      cfg
-	client *http.Client
-	rdb    *redis.Client
+	c           cfg
+	client      *http.Client
+	rdb         *redis.Client
+	routeClient *http.Client
 }
 
 // hop is the per-request ECG context carried in baggage.
@@ -248,6 +266,10 @@ func (s *svc) handle(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	span := trace.SpanFromContext(ctx)
 	bag := baggage.FromContext(ctx)
+	if bag.Member("ecg.mode").Value() == "shadow" && (r.Method != "GET" || r.URL.Path != "/todos") {
+		http.Error(w, "shadow traffic is read-only", http.StatusMethodNotAllowed)
+		return
+	}
 
 	h := hop{
 		scenario: bag.Member(ecg.BagScenario).Value(),
@@ -383,7 +405,7 @@ func evalFlags(tenant string) string {
 // are not replayed without an idempotency key.
 func (s *svc) forward(ctx context.Context, h hop, r *http.Request, body []byte) (int, apiResp, int, error) {
 	c := s.c
-	rt, err := route(ctx, c, c.next, h.prefixOut, h.eligible)
+	rt, err := route(ctx, c, c.next, h.prefixOut, h.eligible, s.routeClient)
 	if err != nil {
 		return 0, apiResp{}, 0, err
 	}

@@ -12,9 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/base698/ecg-demo/ecg"
-	"github.com/base698/ecg-demo/internal/democontract"
 	"github.com/alicebob/miniredis/v2"
+	"github.com/base698/ecg-demo/ecg"
+	"github.com/base698/ecg-demo/evidence"
+	"github.com/base698/ecg-demo/internal/democontract"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -29,8 +30,13 @@ func newTestController(t *testing.T) *controller {
 }
 func registerTest(t *testing.T, c *controller, service, version string) instance {
 	t.Helper()
-	in := instance{ID: service + "-" + version, Service: service, Version: version, Contract: "v1", Config: "default", Addr: "http://" + service + version, Next: map[string]string{"api": "tasks", "tasks": "store"}[service]}
+	in := instance{ID: service + "-" + version, Service: service, Version: version, Contract: "v1", Config: "default", Artifact: "fixture-binary", Bootstrap: version == "1", Addr: "http://" + service + version, Next: map[string]string{"api": "tasks", "tasks": "store"}[service]}
 	in.NodeKey = ecg.NodeKey(in.Service, in.Version, in.Contract, in.Config)
+	run := democontract.IsolationRun{Release: in.release(), Suite: democontract.IsolationSuite}
+	for i, req := range democontract.IsolationRequirements(in.release()) {
+		run.Observations = append(run.Observations, evidence.Observation{Version: evidence.WireVersion, ID: fmt.Sprintf("isolated-%s-%d", in.ID, i), Series: req.Series, CompletedAt: time.Now(), Complete: true, Checks: []evidence.CheckResult{{Definition: req.Series.Checks[0], Status: "passed"}}})
+	}
+	in.Isolated = &run
 	b, _ := json.Marshal(in)
 	w := httptest.NewRecorder()
 	c.handleRegister(w, httptest.NewRequest("POST", "/register", bytes.NewReader(b)))

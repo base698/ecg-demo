@@ -69,6 +69,7 @@ services:
       SERVICE: api
       VERSION: "1"
       INSTANCE_ID: ecg-api-v1
+      BOOTSTRAP: "true"
       TIMEOUT_MS: "3000"
 
   tasks-v1:
@@ -80,6 +81,7 @@ services:
       SERVICE: tasks
       VERSION: "1"
       INSTANCE_ID: ecg-tasks-v1
+      BOOTSTRAP: "true"
       TIMEOUT_MS: "400"     # store's slow path takes 900ms → timeout → retry
 
   store-v1:
@@ -91,6 +93,7 @@ services:
       SERVICE: store
       VERSION: "1"
       INSTANCE_ID: ecg-store-v1
+      BOOTSTRAP: "true"
 
   # ---- synthetic traffic (same ingress the browser uses) ----------------------
   loadgen:

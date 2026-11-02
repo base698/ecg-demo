@@ -52,23 +52,24 @@ type cell struct {
 	Full   int    `json:"full"`
 }
 type state struct {
-	Now             int64             `json:"now"`
-	Policy          policy            `json:"policy"`
-	Services        []string          `json:"services"`
-	Instances       []instance        `json:"instances"`
-	Obligations     []obligation      `json:"obligations"`
-	Nodes           []node            `json:"nodes"`
-	Edges           []edge            `json:"edges"`
-	Paths           []pathRec         `json:"paths"`
-	Matrix          map[string]any    `json:"matrix"`
-	Recent          []json.RawMessage `json:"recent"`
-	Events          []json.RawMessage `json:"events"`
-	Stats           map[string]string `json:"stats"`
-	Invalidated     map[string]int64  `json:"invalidated"`
-	Scenarios       []string          `json:"scenarios"`
-	LedgerError     string            `json:"ledger_error"`
-	ActiveCandidate string            `json:"active_candidate"`
-	Capabilities    map[string]string `json:"capabilities"`
+	Now              int64             `json:"now"`
+	Policy           policy            `json:"policy"`
+	Services         []string          `json:"services"`
+	Instances        []instance        `json:"instances"`
+	Obligations      []obligation      `json:"obligations"`
+	Nodes            []node            `json:"nodes"`
+	Edges            []edge            `json:"edges"`
+	Paths            []pathRec         `json:"paths"`
+	Matrix           map[string]any    `json:"matrix"`
+	Recent           []json.RawMessage `json:"recent"`
+	Events           []json.RawMessage `json:"events"`
+	Stats            map[string]string `json:"stats"`
+	Invalidated      map[string]int64  `json:"invalidated"`
+	Scenarios        []string          `json:"scenarios"`
+	LedgerError      string            `json:"ledger_error"`
+	ActiveCandidates []string          `json:"active_candidates"`
+	ActiveCandidate  string            `json:"active_candidate"`
+	Capabilities     map[string]string `json:"capabilities"`
 }
 
 func (c *controller) handleState(w http.ResponseWriter, r *http.Request) {
@@ -76,12 +77,25 @@ func (c *controller) handleState(w http.ResponseWriter, r *http.Request) {
 	defer c.mu.Unlock()
 	ctx := r.Context()
 	st := state{Now: time.Now().UnixMilli(), Policy: c.pol, Matrix: map[string]any{}, Invalidated: map[string]int64{}, Services: []string{}, Instances: []instance{}, Obligations: []obligation{}, Nodes: []node{}, Edges: []edge{}, Paths: []pathRec{}, Recent: []json.RawMessage{}, Events: []json.RawMessage{}, Scenarios: []string{}, LedgerError: c.ledgerErr,
-		Capabilities: map[string]string{"coverage": "exact full paths in a pinned rollout plan", "correctness": "todo-response-v1 request-local response assertions", "confidence": "95% one-sided binomial bound; assumes independent representative requests", "performance": "mean latency compared with fresh matching baseline paths", "scope": "linear synchronous HTTP chain, one candidate per request", "not_proven": "durability, authorization, business invariants, fan-out, async workflows, automatic rollback"}}
+		Capabilities: map[string]string{"coverage": "exact full paths in a pinned rollout plan", "correctness": "todo-response-v1 request-local response assertions", "confidence": "95% one-sided binomial bound; assumes independent representative requests", "performance": "mean latency compared with fresh matching baseline paths", "scope": "parallel independent canaries, one candidate per request; read-only shadow traffic", "qualification": "declared isolated fixture checks per immutable release; continuous live admission and evidence-based rollback", "not_proven": "production durability, authorization, general side-effect isolation, fan-out, async workflows, distributed controller coordination"}}
 	st.Services = c.serviceOrder(ctx)
 	if st.Services == nil {
 		st.Services = []string{}
 	}
 	st.Instances = c.instances(ctx)
+	for i := range st.Instances {
+		in := &st.Instances[i]
+		in.ShadowStatus, in.ShadowCount = c.shadowStatus(ctx, *in)
+		if in.Role == "baseline" {
+			in.Exposure = "stable"
+		}
+		if in.Role == "draining" || in.Role == "suspended" || in.Role == "retired" {
+			in.Exposure = in.Role
+		}
+		if in.IsolationStatus != "passed" {
+			in.Exposure = "blocked"
+		}
+	}
 	if st.Instances == nil {
 		st.Instances = []instance{}
 	}
@@ -107,12 +121,15 @@ func (c *controller) handleState(w http.ResponseWriter, r *http.Request) {
 				ob := c.obligationsFor(ctx, in, b)
 				st.Obligations = append(st.Obligations, ob)
 				candStatus[in.NodeKey] = ob.Status
+				if in.Exposure == "canary" && in.IsolationStatus == "passed" && ob.Status != "failed" && ob.Status != "unknown" {
+					st.ActiveCandidates = append(st.ActiveCandidates, in.ID)
+				}
 			}
 		}
 	}
-	// Identify the oldest rollout owner without incrementing routing counters.
-	plan, _ := c.makePlan(ctx, true)
-	st.ActiveCandidate = plan.Candidate
+	if len(st.ActiveCandidates) > 0 {
+		st.ActiveCandidate = st.ActiveCandidates[0]
+	}
 	iter := c.rdb.Scan(ctx, 0, "inv:*", 100).Iterator()
 	for iter.Next(ctx) {
 		st.Invalidated[strings.TrimPrefix(iter.Val(), "inv:")], _ = c.rdb.Get(ctx, iter.Val()).Int64()

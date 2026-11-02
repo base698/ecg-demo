@@ -16,9 +16,18 @@ and the routed todo demo that exercises them.
 limits, and local-module imports. [Generic label example](examples/labels/README.md)
 uses a fictional local service and runs through the public SDK.
 
-[Semantic evidence design](docs/semantic-evidence.md) explains unsupported assistant
-claims, trusted runtime facts, and the distinction between failed and unknown checks.
-The example uses invented fixtures and does not include a voice provider integration.
+## Continuous qualification
+
+Each immutable version runs isolated contract checks, then gathers its own
+canary or shadow evidence. Healthy versions can progress independently while
+other versions remain on hold. The controller promotes qualified canaries,
+withdraws expired or failing stable admissions, and retires drained versions.
+
+![Design reference: independent versions run isolated tests and share a production traffic controller in stable, canary, and shadow modes](docs/images/continuous-qualification.png)
+
+[Design and implementation](docs/continuous-qualification.md) maps this reference
+to the working demo and explains its boundaries: private local fixtures,
+read-only shadow traffic, conditional confidence, and a single controller.
 
 ## Library service by itself
 
@@ -59,7 +68,8 @@ the library store retains its own history and replay protection.
 
 ECG turns traces into **deployment evidence**. A candidate inherits successful
 path shapes and scenarios from its predecessor, then must exercise those paths
-with the **current baseline versions of every other service**. Requests carry a
+with the **current baseline versions of every other service**. Eligible traffic
+rotates across independent candidates. Requests carry a
 pinned routing plan. At most one candidate participates in an experiment, so
 concurrent deployments cannot silently certify one another.
 
@@ -143,7 +153,8 @@ percentile SLO or significance test.
    other tenants use baselines. An unverified candidate is never a fallback
    when a baseline disappears. Rare rows can be exercised using the todo app.
 
-3. Once it promotes, the old version drains. Retire it:
+3. Once it promotes, the old version drains and retires automatically after at
+   least 90 seconds while its replacement remains qualified. To retire manually:
    ```bash
    ./retire.sh ecg-tasks-v1
    ```
@@ -155,7 +166,8 @@ percentile SLO or significance test.
    ```bash
    ./deploy.sh tasks 3 FAIL_RATE=0.3
    ```
-   Its failed or uncertain health signals stop experiment traffic. Retire it
+   Isolated checks can block it before live exposure. If a failure first appears
+   in live traffic, failed or uncertain health signals stop experiment traffic. Retire it
    before the next demonstration. Failures in new scenarios and failed outbound
    requests without a downstream server span still block the candidate.
 
@@ -174,10 +186,24 @@ percentile SLO or significance test.
    status codes. Add a todo or list a nonempty collection. Response assertions
    fail and prevent promotion. The demo mutates responses, not persisted data.
 
-7. Deploy two healthy candidates. The oldest viable candidate receives the
-   rollout slot; the other waits. Each request pins all selected versions through
-   the entire chain. The second candidate's requirements are reevaluated after
-   the first promotes.
+7. Deploy independent candidates together:
+   ```bash
+   ./deploy.sh api 3
+   ./deploy.sh tasks 5
+   ./deploy.sh store 4 EXPOSURE=shadow
+   ```
+   Both canaries receive separate experiment requests while the shadow version
+   receives mirrored list reads. The **Version qualification** cards show each
+   isolated suite, traffic mode, and shadow results. Use **admit canary** when
+   ready to collect live evidence for the shadow version. No candidate waits for
+   another candidate's missing rows. After either promotes, affected requirements
+   are recomputed against the new dependency combination.
+
+8. Stable admission is continuously reevaluated. Regression or expired evidence
+   withdraws a version; rollback requires fresh evidence for a still-running
+   predecessor. The controller returns errors when no qualified baseline remains.
+   This is a deliberate demo of evidence expiry, so stopping traffic long enough
+   can withdraw admission.
 
 Use a new version/instance ID for changed running configuration. A heartbeat
 cannot overwrite an instance's identity while retaining its old role. `CONTRACT`
@@ -212,17 +238,20 @@ writes, authorization, tenant isolation, or cross-request business invariants.
 They are application instrumentation, not an independent external oracle.
 
 The execution model supports a linear synchronous HTTP chain with retries.
-Fan-out, joins, queues, asynchronous workflows, and automatic rollback are not
-implemented. Requirements come from observed successful baseline paths, so
+Fan-out, joins, queues, and asynchronous workflows are not implemented.
+Rollback is limited to a running predecessor with sufficient current evidence;
+shadowing is limited to read-only list requests. Requirements come from observed successful baseline paths, so
 unobserved critical behavior and newly introduced behavior still need explicit
 tests. Confidence assumes representative unsampled or appropriately designed
 traffic; the demo exporter records all requests.
 
 The controller is a local demonstration, with in-memory Redis and a synchronous
 routing dependency. It is not a production deployment controller. Baselines are
-bootstrapped explicitly by first registration; an approved identity can rejoin
-after a restart, but a different identity cannot replace a missing baseline
-without evidence.
+bootstrapped by the explicit Compose setting after isolated checks, with a
+90-second window to gather live evidence. An approved, unrevoked identity can
+rejoin after a restart. A different identity cannot replace a missing baseline
+without evidence. The fixture suite uses local peer handlers and a private Redis
+emulator; it does not certify production storage or provide an OS sandbox.
 
 ## Tests
 
@@ -240,13 +269,14 @@ Tests use an in-process Redis emulator and require no running Docker services.
 They cover evidence windows, statistical distinctions, semantic and latency
 regressions, full-path requirements, trace replay/structure, transport failures,
 retirement, routing plans, configuration identity, policy concurrency, idempotent
-completion, and suppression of automatic retries for writes.
+completion, suppression of automatic retries for writes, parallel qualification,
+shadow separation, isolated checks, admission withdrawal, and qualified rollback.
 
 ## Next experiment
 
-Add a real version-dependent wire-contract change and a declared critical
-scenario. Show an aggregate canary metric staying healthy while a specific
-business operation fails against one downstream version. Expose a targeted test
-action that closes that exact requirement, and measure time to decision and
-customer exposure. Coordinated multi-candidate plans should be a later extension
-with explicit compatibility and rollback requirements.
+Add a real version-dependent wire-contract change and a declared critical live
+scenario. Show two candidates progressing independently while one specific
+business operation fails against a downstream version. Then add an external
+fixture runner with real disposable databases and stronger producer identity.
+General write shadowing and continuous latency SLOs need separate evidence and
+side-effect controls; they are not implied by the current read-only shadow mode.

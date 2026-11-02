@@ -5,17 +5,17 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/base698/ecg-demo/ecg"
 )
 
 // A per-request plan pins all versions. At most one candidate is tested, and
-// concurrent deployments wait their turn instead of certifying one another.
+// independent candidates receive separate requests without certifying one another.
 type routePlan struct {
 	Instances map[string]string `json:"instances"`
 	Candidate string            `json:"candidate,omitempty"`
+	Mode      string            `json:"mode,omitempty"`
 	CreatedMS int64             `json:"created_ms"`
 }
 
@@ -32,24 +32,27 @@ func (c *controller) makePlan(ctx context.Context, eligible bool) (routePlan, er
 	if len(bases) == 0 {
 		return p, fmt.Errorf("no baseline available")
 	}
-	if !eligible || c.ledgerErr != "" {
+	for _, service := range c.serviceOrder(ctx) {
+		if _, ok := bases[service]; !ok {
+			return p, fmt.Errorf("missing baseline for %s", service)
+		}
+	}
+	if c.ledgerErr != "" {
+		return p, fmt.Errorf("evidence store is unavailable")
+	}
+	if !eligible {
 		return p, nil
 	}
-	sort.Slice(insts, func(i, j int) bool {
-		if insts[i].Registered == insts[j].Registered {
-			return insts[i].ID < insts[j].ID
-		}
-		return insts[i].Registered < insts[j].Registered
-	})
+	var viable []instance
 	for _, cand := range insts {
-		if cand.Role != "candidate" {
+		if cand.Role != "candidate" || cand.Exposure != "canary" || cand.IsolationStatus != "passed" {
 			continue
 		}
 		base, ok := bases[cand.Service]
 		if !ok {
 			continue
 		}
-		ob := c.obligationsFor(ctx, cand, base)
+		ob := c.routingObligation(ctx, cand, base)
 		if ob.Status == "failed" || ob.Status == "unknown" {
 			continue
 		}
@@ -65,12 +68,13 @@ func (c *controller) makePlan(ctx context.Context, eligible bool) (routePlan, er
 			prefix = ecg.Chain(prefix, b.NodeKey)
 		}
 		if ob.deficitFor(prefix, c.pol.Threshold) > 0 {
-			p.Instances[cand.Service] = cand.ID
-			p.Candidate = cand.ID
+			viable = append(viable, cand)
 		}
-		// Oldest viable candidate owns the rollout slot even while its baseline
-		// warms up or it waits for the promotion loop.
-		break
+	}
+	if len(viable) > 0 {
+		cand := viable[c.rolloutCursor%uint64(len(viable))]
+		c.rolloutCursor++
+		p.Instances[cand.Service], p.Candidate, p.Mode = cand.ID, cand.ID, "canary"
 	}
 	return p, nil
 }
@@ -100,12 +104,12 @@ func (c *controller) routeInPlan(ctx context.Context, service, prefix string, el
 	candidateCount := 0
 	for _, id := range p.Instances {
 		in, ok := insts[id]
-		if !ok || in.Role == "retired" {
+		if !ok || in.Role == "retired" || in.Role == "suspended" || in.IsolationStatus != "passed" {
 			return nil, fmt.Errorf("planned instance unavailable")
 		}
 		if in.Role == "candidate" {
 			candidateCount++
-			if !eligible || id != p.Candidate {
+			if !eligible || id != p.Candidate || (p.Mode == "shadow" && in.Exposure != "shadow") || (p.Mode != "shadow" && in.Exposure != "canary") {
 				return nil, fmt.Errorf("candidate not authorized by routing plan")
 			}
 		}
@@ -134,4 +138,24 @@ func (c *controller) pickRoute(ctx context.Context, service, prefix string, elig
 		return nil, err
 	}
 	return c.routeInPlan(ctx, service, prefix, eligible, p)
+}
+
+// Cache only traffic scheduling for one second. Admission decisions always
+// reevaluate directly. Failures, policy changes, and lifecycle changes evict it.
+type routingAssessment struct {
+	at         time.Time
+	obligation obligation
+}
+
+func (c *controller) routingObligation(ctx context.Context, cand, base instance) obligation {
+	key := cand.ID + ":" + base.NodeKey
+	if cached, ok := c.routeAssessments[key]; ok && time.Since(cached.at) < time.Second {
+		return cached.obligation
+	}
+	ob := c.obligationsFor(ctx, cand, base)
+	if c.routeAssessments == nil {
+		c.routeAssessments = map[string]routingAssessment{}
+	}
+	c.routeAssessments[key] = routingAssessment{at: time.Now(), obligation: ob}
+	return ob
 }

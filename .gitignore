@@ -28,3 +28,6 @@ compose.test.yml
 *.docx
 *.xlsx
 *.bak
+
+# Reviewed design reference used by the README.
+!docs/images/continuous-qualification.png
