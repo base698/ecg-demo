@@ -1,0 +1,128 @@
+x-svc: &svc
+  image: ecg-demo:local
+  build: .
+  depends_on:
+    controller:
+      condition: service_started
+    otel-collector:
+      condition: service_started
+  environment: &svc-env
+    CONTROLLER: http://controller:9000
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    REDIS_ADDR: redis:6379
+  restart: on-failure   # exit 0 (retired by the controller) must not restart
+
+services:
+  evidence:
+    image: ecg-evidence:local
+    build:
+      context: .
+      target: evidence
+    command: ["-listen", "0.0.0.0:9100", "-redis", "redis:6379", "-namespace", "todo-demo"]
+    depends_on: [redis]
+    restart: on-failure
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports: ["6379:6379"]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol/config.yaml:ro
+    ports: ["4317:4317", "4318:4318"]
+    depends_on: [controller, jaeger]
+
+  jaeger:
+    image: jaegertracing/jaeger:2.7.0
+    ports: ["16686:16686"]
+
+  # Control plane: registry, coverage-aware router, OTLP ledger, obligations,
+  # promotion, todo-app ingress and the dashboard. http://localhost:9000
+  controller:
+    image: ecg-demo:local
+    build: .
+    command: ["/app/controller"]
+    environment:
+      REDIS_ADDR: redis:6379
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      ECG_EVIDENCE_ENDPOINT: http://evidence:9100
+      THRESHOLD: "6"          # unique fresh requests per full-path requirement
+      MAX_ERR_RATE: "0.05"    # observed-error budget; one error cannot silently pass
+      REQUIRE_CONFIDENCE: "false" # demo coverage mode; true gates on the 95% bound
+      MAX_LATENCY_INCREASE_MS: "100"
+      MAX_LATENCY_RATIO: "2"
+      CANARY_TENANTS: acme,initech,hooli   # tenants eligible to hit unverified candidates
+      EVIDENCE_TTL_S: "300"
+    ports: ["9000:9000"]
+    depends_on: [redis]
+
+  # ---- baselines ------------------------------------------------------------
+  api-v1:
+    <<: *svc
+    container_name: ecg-api-v1
+    command: ["/app/service"]
+    environment:
+      <<: *svc-env
+      SERVICE: api
+      VERSION: "1"
+      INSTANCE_ID: ecg-api-v1
+      TIMEOUT_MS: "3000"
+
+  tasks-v1:
+    <<: *svc
+    container_name: ecg-tasks-v1
+    command: ["/app/service"]
+    environment:
+      <<: *svc-env
+      SERVICE: tasks
+      VERSION: "1"
+      INSTANCE_ID: ecg-tasks-v1
+      TIMEOUT_MS: "400"     # store's slow path takes 900ms → timeout → retry
+
+  store-v1:
+    <<: *svc
+    container_name: ecg-store-v1
+    command: ["/app/service"]
+    environment:
+      <<: *svc-env
+      SERVICE: store
+      VERSION: "1"
+      INSTANCE_ID: ecg-store-v1
+
+  # ---- synthetic traffic (same ingress the browser uses) ----------------------
+  loadgen:
+    <<: *svc
+    command: ["/app/loadgen"]
+    environment:
+      INGRESS: http://controller:9000
+      RPS: "8"
+      CHAOS_RATE: "0.15"
+      QUIET: "1"
+
+  # ---- templates used by ./deploy.sh (never started by `up`) ------------------
+  svc-api:
+    <<: *svc
+    profiles: [template]
+    command: ["/app/service"]
+    environment:
+      <<: *svc-env
+      SERVICE: api
+      TIMEOUT_MS: "3000"
+  svc-tasks:
+    <<: *svc
+    profiles: [template]
+    command: ["/app/service"]
+    environment:
+      <<: *svc-env
+      SERVICE: tasks
+      TIMEOUT_MS: "400"
+  svc-store:
+    <<: *svc
+    profiles: [template]
+    command: ["/app/service"]
+    environment:
+      <<: *svc-env
+      SERVICE: store

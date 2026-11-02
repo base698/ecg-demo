@@ -1,0 +1,33 @@
+# Standard OpenTelemetry Collector pipeline: every service exports OTLP here;
+# the collector fans traces out to Jaeger (for browsing) and to the ECG
+# controller, which is just another OTLP/HTTP consumer that turns traces into
+# versioned path attestations.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 500ms
+
+exporters:
+  otlphttp/ecg-controller:
+    endpoint: http://controller:9000
+    compression: none
+    tls:
+      insecure: true
+  otlphttp/jaeger:
+    endpoint: http://jaeger:4318
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/ecg-controller, otlphttp/jaeger]

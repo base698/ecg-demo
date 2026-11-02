@@ -1,0 +1,42 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["evidence-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+  evidence:
+    image: ecg-evidence:local
+    build:
+      context: .
+      target: evidence
+    command: ["-listen", "0.0.0.0:9100", "-redis", "redis:6379", "-namespace", "${ECG_NAMESPACE:-default}"]
+    environment:
+      ECG_API_TOKEN: ${ECG_API_TOKEN:-}
+    ports: ["127.0.0.1:${ECG_PORT:-9100}:9100"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:9100/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    stop_grace_period: 10s
+  labels-example:
+    image: ecg-labels-example:local
+    build:
+      context: .
+      target: labels-example
+    profiles: [example]
+    command: ["-endpoint", "http://evidence:9100"]
+    environment:
+      ECG_API_TOKEN: ${ECG_API_TOKEN:-}
+    depends_on:
+      evidence:
+        condition: service_healthy
+volumes:
+  evidence-data:
